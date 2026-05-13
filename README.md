@@ -1,6 +1,14 @@
-# D4 Lite Companion v9.1 Final Playtest FIXED
+# D4 Lite Companion v12 Skill/Paragon Path
 
-Version corrigée de la V9 finale avant test en jeu.
+V12 preview :
+- Skill Tree Path
+- Paragon Path
+- NEXT SKILL POINT
+- NEXT PARAGON
+- progression globale
+- objectifs build V10 conservés
+
+Important : le parsing Mobalytics reste best-effort. Si le chemin exact n'est pas lisible, la V12 affiche un fallback structuré.
 
 ## Lancer
 
@@ -14,5 +22,3 @@ Puis ouvrir :
 ```text
 http://localhost:4734
 ```
-
-Si une vieille version reste affichée : Ctrl+F5.
