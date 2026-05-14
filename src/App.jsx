@@ -1,340 +1,464 @@
-
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 
-const LS_KEY = "d4-lite-companion-v12-state";
+const LS_KEY = "d4-companion-v13";
 
-const defaultSkillPath = [
-  { level: "70", name: "Dread Claws", type: "core", why: "Mécanique principale du build : vérifie que tu as bien la base du setup." },
-  { level: "70+", name: "Command Fallen", type: "core", why: "Élément central de la rotation / synergie du build." },
-  { level: "70+", name: "Nether Step", type: "mobility", why: "Mobilité et confort : utile pour fluidifier les combats." },
-  { level: "70+", name: "Profane Sentinel", type: "synergy", why: "Synergie importante à comparer avec la variante choisie." }
-];
+// ── D4 skill point gain rules ─────────────────────────────────────────────────
+// Lvl 1→70 = 1 SP/level = 69 SP + ~14 from Renown = ~83 SP total at 70
+// We approximate: SP ≈ level - 1 (up to ~70) + renown bonus
+function levelToSP(level, maxLevel = 70) {
+  if (level <= 1) return 0;
+  const base = Math.min(level - 1, maxLevel - 1);
+  // Renown bonus: ~10 SP total
+  const renown = level >= maxLevel ? 10 : Math.floor((level / maxLevel) * 10);
+  return base + renown;
+}
 
-const defaultParagonPath = [
-  { step: 1, name: "Plateau de départ", type: "board", why: "Commence par sécuriser les premiers nœuds utiles et le chemin vers le socket." },
-  { step: 2, name: "Premier glyphe utile", type: "glyph", why: "Place le glyphe conseillé par le guide et commence à le monter." },
-  { step: 3, name: "Nœuds rares proches", type: "rare", why: "Prends les rares qui apportent survie/ressource avant le min-max." }
-];
+// Paragon boards unlock order roughly every 100-150 paragon points
+function paragonLevelToBoard(pl) {
+  if (pl < 1) return 0;
+  if (pl < 25) return 0;
+  if (pl < 60) return 1;
+  if (pl < 100) return 2;
+  if (pl < 150) return 3;
+  return 4;
+}
 
-const defaultGoals = [
-  { id:"goal:aspect-du-peril", type:"gear", name:"Aspect du péril", action:"Trouver puis équiper : Aspect du péril", why:"Aide à stabiliser le build. Prioritaire si tu galères en Pénitence.", priority:"CORE", kind:"survie", icon:"🛡" },
-  { id:"goal:maximum-ressource", type:"gear", name:"Maximum ressource", action:"Trouver puis équiper : Maximum ressource", why:"Évite de tomber à court de ressource pendant les combats.", priority:"CORE", kind:"fluidité", icon:"⚡" }
-];
-
-const defaultState = {
-  level: 70,
-  mode: "Transition endgame",
-  build: {
-    title: "Aucun build importé",
-    description: "Importe une URL Mobalytics / Maxroll / D4Builds.",
-    goals: defaultGoals,
-    skillPath: defaultSkillPath,
-    paragonPath: defaultParagonPath,
-    parserNote: "Fallback local."
-  },
-  goalState: {},
-  skillState: {},
-  paragonState: {},
-  hideDone: true,
-  g9: false
+const SECTION_COLOR = {
+  "Core":        "#e85d3a",
+  "Mobility":    "#4db8ff",
+  "Defensive":   "#5dd48f",
+  "Conjuration": "#c084fc",
+  "Ultimate":    "#ff4466",
+  "Key Passive": "#fbbf24",
+  "Summon":      "#fb923c",
+  "Passive":     "#94a3b8",
+};
+const SECTION_ICON = {
+  "Core":"⚔️","Mobility":"💨","Defensive":"🛡️",
+  "Conjuration":"🔮","Ultimate":"💀","Key Passive":"🔑",
+  "Summon":"👹","Passive":"✨",
 };
 
-function loadState() {
-  try {
-    return { ...defaultState, ...JSON.parse(localStorage.getItem(LS_KEY) || "{}") };
-  } catch {
-    return defaultState;
-  }
+function defaultState() {
+  return { level: 1, paragonLevel: 0, skillChecked: {}, glyphChecked: {}, tab: "skills", hideDone: false };
 }
 
-function saveState(state) {
-  localStorage.setItem(LS_KEY, JSON.stringify(state));
+function load() {
+  try { return { ...defaultState(), ...JSON.parse(localStorage.getItem(LS_KEY) || "{}") }; }
+  catch { return defaultState(); }
 }
 
-function normalize(value) {
-  return String(value || "").toLowerCase().trim();
-}
+// ── Sub-components ────────────────────────────────────────────────────────────
 
-function rank(priority) {
-  return { CORE: 0, IMPORTANT: 1, CONFORT: 2, ENDGAME: 3 }[priority] ?? 9;
-}
-
-function visibleGoals(state, goals) {
-  const sorted = [...(goals || [])].sort((a, b) => rank(a.priority) - rank(b.priority));
-  if (!state.hideDone) return sorted;
-  return sorted.filter(g => !state.goalState[g.id]?.equipped);
-}
-
-function completion(state) {
-  const goals = state.build.goals || [];
-  const skillPath = state.build.skillPath || [];
-  const paragonPath = state.build.paragonPath || [];
-  const total = goals.length + skillPath.length + paragonPath.length;
-  if (!total) return 0;
-
-  const doneGoals = goals.filter(g => state.goalState[g.id]?.equipped).length;
-  const doneSkills = skillPath.filter((_, i) => state.skillState[`skill:${i}`]).length;
-  const doneParagon = paragonPath.filter((_, i) => state.paragonState[`paragon:${i}`]).length;
-
-  return Math.round((doneGoals + doneSkills + doneParagon) / total * 100);
-}
-
-function phase(state) {
-  if (state.level < 50) return "Leveling";
-  if (state.level < 70) return "Midgame";
-  if (state.level >= 70 && completion(state) < 45) return "Transition endgame";
-  return "Early endgame";
-}
-
-function nextSkill(state) {
-  const path = state.build.skillPath || [];
-  const idx = path.findIndex((_, i) => !state.skillState[`skill:${i}`]);
-  return idx >= 0 ? { index: idx, item: path[idx] } : null;
-}
-
-function nextParagon(state) {
-  const path = state.build.paragonPath || [];
-  const idx = path.findIndex((_, i) => !state.paragonState[`paragon:${i}`]);
-  return idx >= 0 ? { index: idx, item: path[idx] } : null;
-}
-
-function iconForType(type) {
-  if (type === "core") return "🔥";
-  if (type === "mobility") return "👟";
-  if (type === "damage") return "💥";
-  if (type === "glyph") return "🔷";
-  if (type === "board") return "🧩";
-  if (type === "rare") return "🟡";
-  return "🔗";
-}
-
-function Panel({ title, count, children }) {
-  return <section className="card"><h2>{title} {count !== undefined && <span className="pill">{count}</span>}</h2>{children}</section>;
-}
-
-function Badge({ children, type }) {
-  return <span className={`badge ${String(type || "").toLowerCase()}`}>{children}</span>;
-}
-
-function GoalCard({ goal, state, setGoal }) {
-  const status = state.goalState[goal.id] || {};
-  const patch = change => setGoal(goal.id, { ...status, ...change });
+function LevelSlider({ label, icon, value, max, onChange }) {
   return (
-    <article className={"goal " + (status.equipped ? "done" : "")}>
-      <div className="goalIcon">{goal.icon}</div>
-      <div className="goalBody">
-        <div className="goalTop">
-          <strong>{goal.action}</strong>
-          <div className="badges"><Badge type={goal.priority}>{goal.priority}</Badge><Badge>{goal.kind}</Badge></div>
-        </div>
-        <p>{goal.why}</p>
-        <div className="checks">
-          <label><input type="checkbox" checked={!!status.obtained} onChange={e => patch({ obtained: e.target.checked })} /> obtenu</label>
-          <label><input type="checkbox" checked={!!status.equipped} onChange={e => patch({ equipped: e.target.checked, obtained: e.target.checked ? true : status.obtained })} /> équipé / validé</label>
-        </div>
+    <div className="slider-wrap">
+      <div className="slider-label">
+        <span>{icon} {label}</span>
+        <strong className="slider-val">{value}</strong>
       </div>
-    </article>
+      <div className="slider-row">
+        <button onClick={() => onChange(Math.max(0, value - 1))}>−</button>
+        <input type="range" min={0} max={max} value={value} onChange={e => onChange(+e.target.value)} />
+        <button onClick={() => onChange(Math.min(max, value + 1))}>+</button>
+      </div>
+    </div>
   );
 }
 
-function PathRow({ item, index, done, onToggle, mode }) {
+function SkillRow({ entry, done, isCurrent, onToggle }) {
+  const color = SECTION_COLOR[entry.section] ?? "#94a3b8";
   return (
-    <article className={"pathRow " + (done ? "done" : "")}>
-      <div className="pathIcon">{mode === "skill" ? iconForType(item.type) : iconForType(item.type)}</div>
-      <div className="pathBody">
-        <div className="goalTop">
-          <strong>{mode === "skill" ? `${item.level} — ${item.name}` : `Étape ${item.step} — ${item.name}`}</strong>
-          <Badge>{item.type}</Badge>
-        </div>
-        <p>{item.why}</p>
-        <label className="pathCheck"><input type="checkbox" checked={done} onChange={e => onToggle(e.target.checked)} /> fait / pris</label>
+    <div className={`sk-row${done ? " done" : ""}${isCurrent ? " current" : ""}`} onClick={() => onToggle(!done)}>
+      <div className="sk-sp" style={{ color }}>{entry.skillPoint}</div>
+      <div className="sk-ico">
+        {entry.icon
+          ? <img src={entry.icon} alt="" onError={e => e.target.style.display = "none"} />
+          : <span>{SECTION_ICON[entry.section] ?? "✨"}</span>}
       </div>
-    </article>
+      <div className="sk-body">
+        <div className="sk-top">
+          <span className="sk-name">{entry.name}</span>
+          <span className="sk-tags">
+            {entry.isNew && !entry.isUpgrade && <span className="tag new">NEW</span>}
+            {entry.isUpgrade && <span className="tag up">+{entry.rank}</span>}
+            {entry.isMaxed && <span className="tag max">MAX</span>}
+          </span>
+        </div>
+        <div className="sk-meta">
+          <span style={{ color }}>{SECTION_ICON[entry.section]} {entry.section}</span>
+          <span className="rank-pips">
+            {Array.from({ length: entry.maxRank }).map((_, i) =>
+              <span key={i} className={`pip${i < entry.rank ? " on" : ""}`} />
+            )}
+          </span>
+        </div>
+      </div>
+      <div className="sk-check">{done ? "✓" : ""}</div>
+    </div>
   );
 }
 
-function timeline(level) {
-  return [
-    ["1-20", "Fondations", "générateur, core skill, survie simple", level >= 1 && level <= 20],
-    ["20-35", "Ressource", "fluidité, mobilité, premières synergies", level > 20 && level <= 35],
-    ["35-50", "Build leveling", "rotation et premiers aspects", level > 35 && level <= 50],
-    ["50-70", "Midgame", "aspects CORE/IMPORTANT et survie", level > 50 && level < 70],
-    ["70+", "Transition endgame", "parangon, glyphes, stats offensives", level >= 70]
-  ];
+function BoardCard({ board, done, isActive, onToggle }) {
+  return (
+    <div className={`board-card${isActive ? " active" : ""}${done ? " done" : ""}`}>
+      <div className="board-num">{board.order}</div>
+      <div className="board-body">
+        <strong>{board.name}</strong>
+        {board.glyphName && <div className="board-glyph">🔷 {board.glyphName}</div>}
+      </div>
+      {isActive && <span className="tag current">EN COURS</span>}
+      {board.glyphName && (
+        <label className="board-check" onClick={e => e.stopPropagation()}>
+          <input type="checkbox" checked={done} onChange={e => onToggle(e.target.checked)} />
+          <span>Glyphe lvl 21+</span>
+        </label>
+      )}
+    </div>
+  );
 }
+
+function NextBox({ label, color, children }) {
+  return (
+    <div className="next-box" style={{ "--nc": color }}>
+      <div className="next-label">{label}</div>
+      <div className="next-content">{children}</div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
 
 function App() {
-  const [state, setState] = useState(loadState);
-  const [url, setUrl] = useState("");
-  const [status, setStatus] = useState("");
-  const [tab, setTab] = useState("progression");
+  const [state, setState] = useState(load);
+  const [build, setBuild] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [noBuild, setNoBuild] = useState(false);
 
-  useEffect(() => saveState(state), [state]);
+  useEffect(() => { localStorage.setItem(LS_KEY, JSON.stringify(state)); }, [state]);
 
-  const pct = completion(state);
-  const ns = nextSkill(state);
-  const np = nextParagon(state);
-  const goals = visibleGoals(state, state.build.goals || []);
+  useEffect(() => {
+    fetch("/api/build")
+      .then(r => r.json())
+      .then(data => {
+        if (data.error === "no_build") { setNoBuild(true); setLoading(false); return; }
+        if (data.error) throw new Error(data.error);
+        setBuild(data); setLoading(false);
+      })
+      .catch(() => { setNoBuild(true); setLoading(false); });
+  }, []);
 
-  function update(partial) {
-    setState(s => ({ ...s, ...partial }));
-  }
+  const set = useCallback(patch => setState(s => ({ ...s, ...patch })), []);
 
-  function setGoal(id, value) {
-    setState(s => ({ ...s, goalState: { ...s.goalState, [id]: value } }));
-  }
+  if (loading) return (
+    <div className="splash">
+      <div className="spinner" />
+      <p>Chargement…</p>
+    </div>
+  );
 
-  function setSkill(index, value) {
-    setState(s => ({ ...s, skillState: { ...s.skillState, [`skill:${index}`]: value } }));
-  }
-
-  function setParagon(index, value) {
-    setState(s => ({ ...s, paragonState: { ...s.paragonState, [`paragon:${index}`]: value } }));
-  }
-
-  async function importBuild() {
-    if (!url) return;
-    setStatus("Import en cours...");
-    try {
-      const response = await fetch("/api/import", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url })
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Erreur import");
-      setState(s => ({ ...s, build: data, goalState: {}, skillState: {}, paragonState: {} }));
-      setStatus("Build importé");
-    } catch (e) {
-      setStatus("Erreur import : " + e.message);
-    }
-  }
-
-  if (state.g9) {
-    return (
-      <div className="app g9">
-        <header>
-          <div><h1>D4 Lite <small>v12</small></h1><p>{phase(state)} · {pct}%</p></div>
-          <button onClick={() => update({ g9: false })}>Vue complète</button>
-        </header>
-        <Panel title="NEXT SKILL POINT">
-          {ns ? <PathRow item={ns.item} index={ns.index} mode="skill" done={!!state.skillState[`skill:${ns.index}`]} onToggle={v => setSkill(ns.index, v)} /> : <div className="summaryBox">Skill path terminé.</div>}
-        </Panel>
-        <Panel title="NEXT PARAGON">
-          {np ? <PathRow item={np.item} index={np.index} mode="paragon" done={!!state.paragonState[`paragon:${np.index}`]} onToggle={v => setParagon(np.index, v)} /> : <div className="summaryBox">Paragon path terminé.</div>}
-        </Panel>
-        <Panel title="Objectifs build">{goals.slice(0, 4).map(g => <GoalCard key={g.id} goal={g} state={state} setGoal={setGoal} />)}</Panel>
+  if (noBuild) return (
+    <div className="splash">
+      <h1>D4 Companion</h1>
+      <p>Aucun build importé.</p>
+      <div className="howto">
+        <p>1. Lance le serveur : <code>npm start</code></p>
+        <p>2. Va sur une page de build <a href="https://mobalytics.gg/diablo-4/builds" target="_blank" rel="noreferrer">Mobalytics</a></p>
+        <p>3. Clique le favori <strong>D4 Companion</strong></p>
+        <p className="hint">Le bookmarklet se trouve dans <code>bookmarklet.js</code> — colle la ligne BOOKMARKLET: comme URL d'un favori.</p>
       </div>
-    );
-  }
+    </div>
+  );
+
+  const skillPath = build.skillPath ?? [];
+  const boards    = build.boards ?? [];
+  const spEarned  = levelToSP(state.level, build.maxLevel ?? 70);
+  const curBoardIdx = Math.min(paragonLevelToBoard(state.paragonLevel), boards.length - 1);
+
+  const doneSkills = skillPath.filter(e => state.skillChecked[e.skillPoint]).length;
+  const doneGlyphs = boards.filter(b => state.glyphChecked[b.glyph]).length;
+  const pct = skillPath.length ? Math.round((doneSkills / skillPath.length) * 100) : 0;
+
+  // Next undone skill that's within earned SPs
+  const nextSkill = skillPath.find(e => !state.skillChecked[e.skillPoint] && e.skillPoint <= spEarned + 1);
+  const currentBoard = boards[curBoardIdx];
+
+  const visibleSkills = skillPath.filter(e =>
+    !(state.hideDone && state.skillChecked[e.skillPoint])
+  );
 
   return (
     <div className="app">
-      <header>
-        <div>
-          <h1>D4 Lite Companion <small>v12 skill/paragon path</small></h1>
-          <p>Preview centrée sur Skill Tree Path + Paragon Path. Parsing exact Mobalytics encore best-effort.</p>
+
+      {/* Header */}
+      <header className="hdr">
+        <div className="hdr-left">
+          <span className="hdr-logo">D4</span>
+          <div>
+            <h1>{build.buildName}</h1>
+            <p className="hdr-sub">par {build.author} · {build.totalSkillPoints} skill pts · {build.totalParagonNodes} nœuds paragon</p>
+          </div>
         </div>
-        <div className="headerActions">
-          <button onClick={() => update({ g9: true })}>Mode G9</button>
-          <button onClick={() => update({ hideDone: !state.hideDone })}>{state.hideDone ? "Afficher validés" : "Cacher validés"}</button>
-          <button onClick={() => update({ goalState: {}, skillState: {}, paragonState: {} })}>Reset progression</button>
-          <span className="saved">Sauvé localement</span>
+        <div className="hdr-ring">
+          <svg viewBox="0 0 40 40">
+            <circle cx="20" cy="20" r="16" fill="none" stroke="#1e2433" strokeWidth="4"/>
+            <circle cx="20" cy="20" r="16" fill="none" stroke="#e85d3a" strokeWidth="4"
+              strokeDasharray={`${pct} 100`} strokeLinecap="round"
+              transform="rotate(-90 20 20)"
+              style={{transition:"stroke-dasharray .4s"}}
+            />
+          </svg>
+          <span>{pct}%</span>
         </div>
       </header>
 
-      <section className="topGrid">
-        <Panel title="Importer">
-          <label>URL Mobalytics / Maxroll / D4Builds</label>
-          <div className="row">
-            <input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://mobalytics.gg/diablo-4/builds/..." />
-            <button onClick={importBuild}>Importer</button>
-          </div>
-          <p className="muted">{status || "Import best-effort. Si le vrai path n’est pas lisible, fallback intelligent."}</p>
-        </Panel>
-        <Panel title="Mon perso">
-          <div className="two">
-            <label>Niveau<input type="number" value={state.level} onChange={e => update({ level: Number(e.target.value) })} /></label>
-            <label>Mode<select value={state.mode} onChange={e => update({ mode: e.target.value })}><option>Leveling</option><option>Midgame / Pénitence</option><option>Transition endgame</option><option>Torment / Endgame</option></select></label>
-          </div>
-          <div className="summaryBox">Phase actuelle : <b>{phase(state)}</b> · progression {pct}%</div>
-          <div className="summaryBox">{state.build.parserNote}</div>
-        </Panel>
+      {/* Level controls */}
+      <section className="levels">
+        <LevelSlider label="Niveau perso" icon="🧙" value={state.level} max={build.maxLevel ?? 70} onChange={v => set({ level: v })} />
+        <LevelSlider label="Niveau paragon" icon="🧩" value={state.paragonLevel} max={300} onChange={v => set({ paragonLevel: v })} />
+        <div className="level-info">
+          <span>⚡ {spEarned} skill points débloqués</span>
+          <span>🗺 Plateau : {currentBoard?.name ?? "—"}</span>
+          <span>✅ {doneSkills}/{skillPath.length} skills · {doneGlyphs}/{boards.length} glyphes</span>
+        </div>
       </section>
 
-      <Panel title={state.build.title}>
-        <p>{state.build.description}</p>
-        <div className="sessionSummary">
-          <b>{phase(state)}</b>
-          <span>Progression globale : {pct}%</span>
-          <span>Skill path : {(state.build.skillPath || []).filter((_, i) => state.skillState[`skill:${i}`]).length}/{(state.build.skillPath || []).length}</span>
-          <span>Parangon : {(state.build.paragonPath || []).filter((_, i) => state.paragonState[`paragon:${i}`]).length}/{(state.build.paragonPath || []).length}</span>
-        </div>
-      </Panel>
+      {/* Next actions */}
+      <section className="nexts">
+        <NextBox label="⚔️ PROCHAIN SKILL" color="#e85d3a">
+          {nextSkill ? (
+            <div className="next-skill">
+              {nextSkill.icon && <img src={nextSkill.icon} alt="" onError={e => e.target.style.display="none"} />}
+              <div>
+                <strong>{nextSkill.name}</strong>
+                <span className="muted"> · SP {nextSkill.skillPoint}</span>
+                {nextSkill.isNew && <span className="tag new">NEW</span>}
+                {nextSkill.isUpgrade && <span className="tag up">rank {nextSkill.rank}/{nextSkill.maxRank}</span>}
+                <div style={{color: SECTION_COLOR[nextSkill.section], fontSize:"0.8em", marginTop:2}}>
+                  {SECTION_ICON[nextSkill.section]} {nextSkill.section}
+                </div>
+              </div>
+            </div>
+          ) : <span className="muted">Tous les skills pris ✓</span>}
+        </NextBox>
 
-      <nav>{[
-        ["progression", "Progression"],
-        ["skills", "Skill Tree Path"],
-        ["paragon", "Paragon Path"],
-        ["goals", "Objectifs build"],
-        ["debug", "Debug"]
-      ].map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}>{label}</button>)}</nav>
+        <NextBox label="🔷 PROCHAIN GLYPHE" color="#c084fc">
+          {currentBoard ? (
+            <div>
+              <strong>{currentBoard.glyphName}</strong>
+              <span className="muted"> sur {currentBoard.name}</span>
+              <div style={{fontSize:"0.8em",marginTop:2,color:"#94a3b8"}}>
+                {state.glyphChecked[currentBoard.glyph] ? "✓ Monté" : "À monter au niveau 21+"}
+              </div>
+            </div>
+          ) : <span className="muted">`Paragon non débloqué (lvl ${build.paragonUnlockLevel ?? 70})`</span>}
+        </NextBox>
+      </section>
 
-      {tab === "progression" && (
-        <main className="threeGrid">
-          <Panel title="Timeline">
-            {timeline(state.level).map(([range, title, detail, active]) => <div key={range} className={"timeline " + (active ? "active" : "")}><b>{range} — {title}</b><p>{detail}</p></div>)}
-          </Panel>
-          <Panel title="NEXT SKILL POINT">
-            {ns ? <PathRow item={ns.item} index={ns.index} mode="skill" done={!!state.skillState[`skill:${ns.index}`]} onToggle={v => setSkill(ns.index, v)} /> : <div className="summaryBox">Skill path terminé.</div>}
-          </Panel>
-          <Panel title="NEXT PARAGON">
-            {np ? <PathRow item={np.item} index={np.index} mode="paragon" done={!!state.paragonState[`paragon:${np.index}`]} onToggle={v => setParagon(np.index, v)} /> : <div className="summaryBox">Paragon path terminé.</div>}
-          </Panel>
+      {/* Tabs */}
+      <nav className="tabs">
+        {[["skills","⚔️ Skills"],["paragon","🧩 Paragon"],["gear","🎽 Équipement"],["talismans","🧿 Talismans"],["merc","⚔️ Mercenaire"]].map(([id, lbl]) => (
+          <button key={id} className={`tab${state.tab===id?" on":""}`} onClick={() => set({ tab: id })}>{lbl}</button>
+        ))}
+        <button className={`tab filter${state.hideDone?" on":""}`} onClick={() => set({ hideDone: !state.hideDone })}>
+          {state.hideDone ? "👁 Tout voir" : "✓ Cacher faits"}
+        </button>
+        <button className="tab reset" onClick={() => { if(confirm("Reset ?")) set({ skillChecked:{}, glyphChecked:{} }); }}>🔄</button>
+      </nav>
+
+      {/* Skills */}
+      {state.tab === "skills" && (
+        <main>
+          <div className="legend">
+            {Object.entries(SECTION_COLOR).map(([s,c]) => (
+              <span key={s} className="leg-item"><span className="leg-dot" style={{background:c}}/>{s}</span>
+            ))}
+          </div>
+          <div className="sk-list">
+            {visibleSkills.map(e => (
+              <SkillRow key={e.skillPoint} entry={e}
+                done={!!state.skillChecked[e.skillPoint]}
+                isCurrent={nextSkill?.skillPoint === e.skillPoint}
+                onToggle={v => set({ skillChecked: { ...state.skillChecked, [e.skillPoint]: v } })}
+              />
+            ))}
+            {visibleSkills.length === 0 && <div className="empty">Tous les skills cochés 🎉</div>}
+          </div>
         </main>
       )}
 
-      {tab === "skills" && (
-        <main className="twoGrid">
-          <Panel title="Skill Tree Path" count={(state.build.skillPath || []).length}>
-            {(state.build.skillPath || []).map((item, i) => <PathRow key={i} item={item} index={i} mode="skill" done={!!state.skillState[`skill:${i}`]} onToggle={v => setSkill(i, v)} />)}
-          </Panel>
-          <Panel title="Lecture">
-            <div className="summaryBox">Cette vue doit remplacer le “je dois prendre quoi maintenant ?”.</div>
-            <div className="summaryBox">Si le guide ne livre pas son ordre exact, l’app affiche au moins les éléments détectés et un ordre raisonnable.</div>
-          </Panel>
+      {/* Paragon */}
+      {state.tab === "paragon" && (
+        <main>
+          {state.level < (build.paragonUnlockLevel ?? 70) && (
+            <div className="warn">🔒 🔒 Paragon débloqué au niveau {build.paragonUnlockLevel ?? 70} (tu es niveau {state.level})</div>
+          )}
+          <div className="boards-grid">
+            {boards.map((b, i) => (
+              <BoardCard key={b.slug} board={b}
+                isActive={i === curBoardIdx && state.level >= 50}
+                done={!!state.glyphChecked[b.glyph]}
+                onToggle={v => set({ glyphChecked: { ...state.glyphChecked, [b.glyph]: v } })}
+              />
+            ))}
+          </div>
+          {build.paragonPriority?.length > 0 && (
+            <div className="glyph-order">
+              <h3>Ordre de montée des glyphes</h3>
+              {build.paragonPriority.map(g => (
+                <div key={g.slug} className={`glyph-row${state.glyphChecked[g.slug]?" done":""}`}>
+                  <span className="glyph-n">{g.order}</span>
+                  <span className="glyph-name">🔷 {g.name}</span>
+                  <span className="glyph-board muted">{g.board}</span>
+                  <input type="checkbox" checked={!!state.glyphChecked[g.slug]}
+                    onChange={e => set({ glyphChecked: { ...state.glyphChecked, [g.slug]: e.target.checked } })}
+                    onClick={e => e.stopPropagation()} />
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="muted small">{build.totalParagonNodes} nœuds paragon au total</p>
         </main>
       )}
 
-      {tab === "paragon" && (
-        <main className="twoGrid">
-          <Panel title="Paragon Path" count={(state.build.paragonPath || []).length}>
-            {(state.build.paragonPath || []).map((item, i) => <PathRow key={i} item={item} index={i} mode="paragon" done={!!state.paragonState[`paragon:${i}`]} onToggle={v => setParagon(i, v)} />)}
-          </Panel>
-          <Panel title="Limite actuelle">
-            <div className="summaryBox">V12 affiche un chemin par étapes.</div>
-            <div className="summaryBox">Le vrai “node par node” demandera d’extraire plus précisément le format interne du planner Mobalytics.</div>
-          </Panel>
+      {/* Gear */}
+      {state.tab === "gear" && (
+        <main>
+          <div className="gear-list">
+            {(build.equipment ?? []).map(item => (
+              <div key={item.slug} className="gear-row">
+                <span className="gear-n">{item.order}</span>
+                <div className="gear-ico">
+                  {item.icon
+                    ? <img src={item.icon} alt="" onError={e => e.target.style.display="none"} />
+                    : <span>🎽</span>}
+                </div>
+                <div className="gear-body">
+                  <strong>{item.name}</strong>
+                  <span className="muted"> ({item.type})</span>
+                  {item.modifiers?.length > 0 && (
+                    <div className="gear-mods">
+                      {item.modifiers.map((m,i) => (
+                        <span key={i} className={`mod ${m.type}`}>{m.name}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
         </main>
       )}
 
-      {tab === "goals" && (
-        <main className="threeGrid">
-          <Panel title="CORE / IMPORTANT">
-            {goals.filter(g => g.priority === "CORE" || g.priority === "IMPORTANT").map(g => <GoalCard key={g.id} goal={g} state={state} setGoal={setGoal} />)}
-          </Panel>
-          <Panel title="CONFORT">
-            {goals.filter(g => g.priority === "CONFORT").map(g => <GoalCard key={g.id} goal={g} state={state} setGoal={setGoal} />)}
-          </Panel>
-          <Panel title="ENDGAME">
-            {goals.filter(g => g.priority === "ENDGAME").map(g => <GoalCard key={g.id} goal={g} state={state} setGoal={setGoal} />)}
-          </Panel>
+      {/* Talismans */}
+      {state.tab === "talismans" && (
+        <main>
+          <div className="talisman-section">
+            <h3>Sceau de saison</h3>
+            <div className="talisman-grid">
+              {(build.talismans ?? []).filter(t => t.category === "Sceau").map(t => (
+                <div key={t.slug} className="talisman-card seal">
+                  <div className="talisman-ico">
+                    {t.icon ? <img src={t.icon} alt="" onError={e => e.target.style.display="none"} /> : <span>🔑</span>}
+                  </div>
+                  <div className="talisman-body">
+                    <strong>{t.name}</strong>
+                    <span className="muted">{t.category}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="talisman-section">
+            <h3>Charmes</h3>
+            <div className="talisman-grid">
+              {(build.talismans ?? []).filter(t => t.category === "Charme").map((t, i) => (
+                <div key={t.slug} className="talisman-card charm">
+                  <div className="talisman-order">{i + 1}</div>
+                  <div className="talisman-ico">
+                    {t.icon ? <img src={t.icon} alt="" onError={e => e.target.style.display="none"} /> : <span>🧿</span>}
+                  </div>
+                  <div className="talisman-body">
+                    <strong>{t.name}</strong>
+                    <span className="muted talisman-type">{t.type}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
         </main>
       )}
 
-      {tab === "debug" && <main className="card"><h2>Debug</h2><pre>{JSON.stringify(state.build, null, 2)}</pre></main>}
+      {/* Mercenary */}
+      {state.tab === "merc" && build.mercenary && (
+        <main>
+          <div className="merc-section">
+            <div className="merc-cards">
+              <div className="merc-card primary">
+                <div className="merc-role">⚔️ Mercenaire principal</div>
+                <strong className="merc-name">{build.mercenary.primary.name}</strong>
+                {build.mercenary.skill && (
+                  <div className="merc-skill">🎯 Skill : <span>{build.mercenary.skill}</span></div>
+                )}
+                {build.mercenary.opportunity && (
+                  <div className="merc-skill muted">💡 Opportunité : <span>{build.mercenary.opportunity}</span></div>
+                )}
+              </div>
+              <div className="merc-card reinforcement">
+                <div className="merc-role">🛡️ Renfort</div>
+                <strong className="merc-name">{build.mercenary.reinforcement.name}</strong>
+              </div>
+            </div>
+
+            <h3>Arbre de compétences</h3>
+            <div className="merc-skills">
+              {(build.mercenary.skillTree ?? []).map((s, i) => (
+                <div key={i} className="merc-skill-row">
+                  <span className="merc-skill-n">{i + 1}</span>
+                  <span className="merc-skill-action">{s.action === "ACTIVATE" ? "✅" : "○"}</span>
+                  <span className="merc-skill-name">{s.name}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="equip-full-section">
+            <h3>🎽 Équipement complet</h3>
+            <div className="equip-full-grid">
+              {(build.equipFull ?? []).map(item => (
+                <div key={item.slot} className={`equip-card ${item.isAspect ? "aspect" : ""} ${item.isUnique ? "unique" : ""}`}
+                  style={{"--item-color": item.color || (item.isAspect ? "#d98c3c" : item.isUnique ? "#cda1d8" : "#8899aa")}}>
+                  <div className="equip-slot">{item.slotLabel}</div>
+                  <div className="equip-card-body">
+                    <div className="equip-card-ico">
+                      {item.icon ? <img src={item.icon} alt="" onError={e => e.target.style.display="none"} /> : <span>🎽</span>}
+                    </div>
+                    <div>
+                      <div className="equip-card-name" style={{color: item.color || "inherit"}}>{item.name}</div>
+                      <div className="equip-card-type muted">{item.isAspect ? "Aspect" : item.isUnique ? "Unique" : item.type}</div>
+                      <div className="equip-card-stats">
+                        {item.gearStats.map((s, si) => (
+                          <span key={si} className={`stat-tag ${s.isGreater ? "greater" : ""} ${s.isMasterwork ? "masterwork" : ""}`}>
+                            {s.isGreater ? ">" : ""}{s.name}{s.isMasterwork ? " ★" : ""}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </main>
+      )}
+
+      {/* Footer */}
+      <footer className="footer">
+        <span className="muted small">Importé le {new Date(build.importedAt).toLocaleDateString("fr-FR")} depuis {build.sourceUrl ? <a href={build.sourceUrl} target="_blank" rel="noreferrer">Mobalytics</a> : "fichier local"}</span>
+        <span className="muted small">D4 Companion v13</span>
+      </footer>
     </div>
   );
 }
