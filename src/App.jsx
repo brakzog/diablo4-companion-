@@ -42,7 +42,7 @@ const SECTION_ICON = {
 };
 
 function defaultState() {
-  return { level: 1, paragonLevel: 0, skillChecked: {}, glyphChecked: {}, tab: "skills", hideDone: false };
+  return { level: 1, paragonLevel: 0, skillChecked: {}, glyphChecked: {}, equipmentChecked: {}, tab: "focus", hideDone: false, g9: false, ignoredSkills: {} };
 }
 
 function load() {
@@ -120,12 +120,748 @@ function BoardCard({ board, done, isActive, onToggle }) {
   );
 }
 
+function ParagonNodeRow({ node, isCurrent, isDone }) {
+  return (
+    <div className={`paragon-node-row${isCurrent ? " current" : ""}${isDone ? " done" : ""}`}>
+      <div className="pn-point">{node.point}</div>
+      <div className="pn-body">
+        <div className="pn-top">
+          <strong>{node.boardName}</strong>
+          {isCurrent && <span className="tag current">PROCHAIN</span>}
+          {node.kind === "start" && <span className="tag new">START</span>}
+          {node.kind === "glyph-route" && <span className="tag up">GLYPHE</span>}
+        </div>
+        <div className="pn-meta">
+          <span>🧩 Board {node.boardOrder ?? "?"}</span>
+          <span>📍 x{node.x}, y{node.y}</span>
+          {node.glyphName && <span>🔷 {node.glyphName}</span>}
+        </div>
+      </div>
+      <div className="pn-check">{isDone ? "✓" : ""}</div>
+    </div>
+  );
+}
+
+function directionBetween(a, b) {
+  if (!a || !b || !Number.isFinite(a.x) || !Number.isFinite(a.y) || !Number.isFinite(b.x) || !Number.isFinite(b.y)) {
+    return "continuer la route";
+  }
+
+  const dx = b.x - a.x;
+
+  // Mobalytics visual board uses an inverted Y axis compared to raw JSON coordinates.
+  // Raw y decreases visually downward/upward depending on board rendering; for the current Moba view,
+  // inverting the delta makes the GPS match the screen path better.
+  const visualDy = -(b.y - a.y);
+
+  const horizontal = dx > 0 ? "droite" : dx < 0 ? "gauche" : "";
+  const vertical = visualDy > 0 ? "haut" : visualDy < 0 ? "bas" : "";
+
+  if (horizontal && vertical) return `${vertical}-${horizontal}`;
+  return horizontal || vertical || "rester sur la route";
+}
+
+function nodeImportance(node, allNodes) {
+  if (!node) return { kind: "travel", label: "Déplacement", icon: "•", why: "Point de passage pour continuer la route." };
+
+  const sameBoard = allNodes.filter(n => n.boardSlug === node.boardSlug);
+  const remainingOnBoard = sameBoard.filter(n => n.point >= node.point);
+  const nextBoardChange = allNodes.find(n => n.point > node.point && n.boardSlug !== node.boardSlug);
+
+  if (node.glyphName && remainingOnBoard.length <= 10) {
+    return {
+      kind: "glyph",
+      label: "Route glyphe",
+      icon: "🔷",
+      why: `Tu avances vers le socket/glyphe ${node.glyphName}. C’est souvent le premier vrai power spike du plateau.`,
+    };
+  }
+
+  if (nextBoardChange && nextBoardChange.point - node.point <= 3) {
+    return {
+      kind: "gate",
+      label: "Sortie plateau",
+      icon: "🧩",
+      why: `Tu approches du prochain plateau : ${nextBoardChange.boardName}.`,
+    };
+  }
+
+  if (node.point % 10 === 0) {
+    return {
+      kind: "milestone",
+      label: "Milestone",
+      icon: "⭐",
+      why: "Petit cap de progression dans le chemin parangon.",
+    };
+  }
+
+  return {
+    kind: "travel",
+    label: "Déplacement",
+    icon: "•",
+    why: "Point de trajet. Pas forcément un gros bonus, mais nécessaire pour atteindre le prochain objectif.",
+  };
+}
+
+function nextPowerSpike(path, paragonLevel, currentBoard) {
+  const future = path.slice(paragonLevel, Math.min(path.length, paragonLevel + 25));
+  const glyph = future.find(n => n.glyphName && n.boardSlug === currentBoard?.slug);
+  if (glyph) {
+    return {
+      title: `Route du glyphe ${glyph.glyphName}`,
+      inPoints: Math.max(0, glyph.point - paragonLevel),
+      icon: "🔷",
+      detail: "Le glyphe est souvent le prochain gros gain réel du plateau.",
+    };
+  }
+
+  const boardChange = future.find(n => n.boardSlug !== currentBoard?.slug);
+  if (boardChange) {
+    return {
+      title: `Nouveau plateau : ${boardChange.boardName}`,
+      inPoints: Math.max(0, boardChange.point - paragonLevel),
+      icon: "🧩",
+      detail: "Nouveau plateau = nouvelle étape importante de progression.",
+    };
+  }
+
+  const milestone = future.find(n => n.point % 10 === 0);
+  if (milestone) {
+    return {
+      title: `Milestone parangon ${milestone.point}`,
+      inPoints: Math.max(0, milestone.point - paragonLevel),
+      icon: "⭐",
+      detail: "Cap intermédiaire avant le prochain objectif majeur.",
+    };
+  }
+
+  return null;
+}
+
+function boardProgress(path, boardSlug, paragonLevel) {
+  const boardNodes = path.filter(n => n.boardSlug === boardSlug);
+  if (!boardNodes.length) return { done: 0, total: 0 };
+  return {
+    done: boardNodes.filter(n => n.point <= paragonLevel).length,
+    total: boardNodes.length,
+  };
+}
+
+function compactRoadmap(path, paragonLevel, currentBoard) {
+  const future = path.slice(paragonLevel, Math.min(path.length, paragonLevel + 18));
+  const items = [];
+  let travelCount = 0;
+
+  for (const node of future) {
+    const imp = nodeImportance(node, path);
+
+    if (imp.kind === "travel") {
+      travelCount += 1;
+      continue;
+    }
+
+    if (travelCount > 0) {
+      items.push({ icon: "➡️", label: `${travelCount} point${travelCount > 1 ? "s" : ""} de trajet`, detail: "sert surtout à avancer" });
+      travelCount = 0;
+    }
+
+    items.push({ icon: imp.icon, label: imp.label, detail: node.boardName, point: node.point });
+  }
+
+  if (travelCount > 0) {
+    items.push({ icon: "➡️", label: `${travelCount} point${travelCount > 1 ? "s" : ""} de trajet`, detail: "avant la suite" });
+  }
+
+  if (!items.length && currentBoard) {
+    items.push({ icon: "🧩", label: currentBoard.name, detail: "Continue le chemin indiqué" });
+  }
+
+  return items.slice(0, 6);
+}
+
+function ParagonBoardMap({ paragonPath, paragonLevel, currentBoard, nextNode }) {
+  const path = paragonPath ?? [];
+  const currentIndex = Math.max(0, Math.min(paragonLevel, path.length - 1));
+  const previous = path[Math.max(0, currentIndex - 1)];
+  const nextSteps = path.slice(paragonLevel, Math.min(path.length, paragonLevel + 12));
+  const boardNodes = currentBoard ? path.filter(n => n.boardSlug === currentBoard.slug) : [];
+  const prog = currentBoard ? boardProgress(path, currentBoard.slug, paragonLevel) : { done: 0, total: 0 };
+  const nextBoardChange = nextSteps.find(n => n.boardSlug !== currentBoard?.slug);
+  const spike = nextPowerSpike(path, paragonLevel, currentBoard);
+  const roadmap = compactRoadmap(path, paragonLevel, currentBoard);
+  const nextImp = nodeImportance(nextNode, path);
+
+  return (
+    <div className="readable-paragon v16">
+      <div className="rp-hero">
+        <div>
+          <span className="muted small">ROUTE PARANGON INTELLIGENTE</span>
+          <h3>{currentBoard?.name ?? nextNode?.boardName ?? "Plateau inconnu"}</h3>
+          <p>
+            Vue GPS basée sur le chemin Mobalytics importé. Directions corrigées pour mieux suivre le rendu visuel.
+          </p>
+        </div>
+        <div className="rp-progress">
+          <strong>{prog.done}/{prog.total}</strong>
+          <span>points sur ce plateau</span>
+        </div>
+      </div>
+
+      {spike && (
+        <div className="power-spike">
+          <div className="spike-icon">{spike.icon}</div>
+          <div>
+            <span className="muted small">PROCHAIN GROS GAIN</span>
+            <h3>{spike.title}</h3>
+            <p>{spike.inPoints <= 0 ? "Maintenant" : `Dans ${spike.inPoints} point${spike.inPoints > 1 ? "s" : ""}`} · {spike.detail}</p>
+          </div>
+        </div>
+      )}
+
+      {nextNode ? (
+        <div className={`rp-next ${nextImp.kind}`}>
+          <div className="rp-next-number">{nextNode.point}</div>
+          <div className="rp-next-body">
+            <span className="muted small">PROCHAIN POINT À POSER</span>
+            <h3>{nextNode.boardName}</h3>
+            <p>
+              Depuis le point précédent, va vers <strong>{directionBetween(previous, nextNode)}</strong>.
+              Coordonnées Mobalytics : <strong>x{nextNode.x}, y{nextNode.y}</strong>.
+            </p>
+            <p>{nextImp.icon} <strong>{nextImp.label}</strong> — {nextImp.why}</p>
+            {nextNode.glyphName && <p>🔷 Tu es sur la route du glyphe <strong>{nextNode.glyphName}</strong>.</p>}
+          </div>
+          <span className="tag current">NEXT</span>
+        </div>
+      ) : (
+        <div className="summaryBox">Tous les points du chemin importé sont couverts.</div>
+      )}
+
+      {nextBoardChange && (
+        <div className="rp-warning">
+          🧩 Changement de plateau bientôt : <strong>{nextBoardChange.boardName}</strong> au point {nextBoardChange.point}.
+        </div>
+      )}
+
+      <div className="rp-two">
+        <section className="rp-panel">
+          <h3>Prochains points</h3>
+          {nextSteps.map((node, index) => {
+            const prev = path[node.point - 2];
+            const imp = nodeImportance(node, path);
+            return (
+              <div key={`${node.slug}-${node.point}`} className={`rp-step ${imp.kind}${index === 0 ? " current" : ""}`}>
+                <div className="rp-step-n">{node.point}</div>
+                <div className="rp-step-body">
+                  <strong>{imp.icon} {node.boardName}</strong>
+                  <span>
+                    {index === 0 ? "À poser maintenant" : `Puis aller ${directionBetween(prev, node)}`}
+                    {" · "}x{node.x}, y{node.y}
+                    {node.glyphName ? ` · ${node.glyphName}` : ""}
+                  </span>
+                  <em>{imp.label}</em>
+                </div>
+              </div>
+            );
+          })}
+        </section>
+
+        <section className="rp-panel">
+          <h3>Roadmap courte</h3>
+          <div className="roadmap">
+            {roadmap.map((item, i) => (
+              <div key={`${item.label}-${i}`} className="roadmap-item">
+                <span className="roadmap-icon">{item.icon}</span>
+                <div>
+                  <strong>{item.label}</strong>
+                  <small>{item.point ? `Point ${item.point} · ` : ""}{item.detail}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <h3 style={{ marginTop: 16 }}>Résumé plateau</h3>
+          <div className="rp-mini-list">
+            {boardNodes.slice(0, 40).map(node => (
+              <span
+                key={`${node.slug}-${node.point}`}
+                className={
+                  node.point <= paragonLevel
+                    ? "taken"
+                    : nextNode?.point === node.point
+                      ? "current"
+                      : nodeImportance(node, path).kind
+                }
+                title={`Point ${node.point} · x${node.x}, y${node.y}`}
+              >
+                {node.point}
+              </span>
+            ))}
+          </div>
+          <p className="muted small">
+            Vert = déjà pris, violet = prochain, orange/bleu = cap utile estimé.
+          </p>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+
+function aspectHint(name = "") {
+  const n = String(name).toLowerCase();
+  if (n.includes("péril") || n.includes("peril")) return { source:"Codex ou loot légendaire", where:"Occultiste / Codex, sinon loot random", why:"Survie prioritaire si tu galères en Pénitence.", type:"survie", icon:"🛡" };
+  if (n.includes("mastodonte") || n.includes("juggernaut")) return { source:"Codex ou loot légendaire", where:"À poser sur pièce défensive", why:"Bon filet de sécurité pour monter en difficulté.", type:"survie", icon:"🛡" };
+  if (n.includes("maître") || n.includes("edgemaster")) return { source:"Aspect légendaire / Codex si dispo", where:"À poser quand ta ressource est stable", why:"Plus fort quand tu maintiens ta ressource haute.", type:"dégâts", icon:"💥" };
+  if (n.includes("accélération") || n.includes("accelerating")) return { source:"Aspect légendaire / Codex si dispo", where:"À poser pour fluidifier le build", why:"Confort : utile, mais pas bloquant.", type:"fluidité", icon:"⚡" };
+  if (n.includes("ressource") || n.includes("resource")) return { source:"Affixe sur équipement", where:"Regarde anneaux, amulette, arme/off-hand selon les rolls", why:"Évite les trous dans ta rotation.", type:"ressource", icon:"🔮" };
+  if (n.includes("critique") || n.includes("critical") || n.includes("vulnérable") || n.includes("vulnerable")) return { source:"Affixe sur équipement", where:"À prioriser quand survie/ressource sont OK", why:"Min-max dégâts, moins urgent si tu meurs ou es à sec.", type:"dégâts", icon:"💥" };
+  return { source:"Loot / Codex / équipement", where:"À vérifier au fil des drops", why:"Objectif utile, pas forcément bloquant.", type:"synergie", icon:"🔗" };
+}
+
+function bestImmediateAction({ nextSkill, nextParagonNode, visibleEquipment, level, maxLevel }) {
+  const mustGear = (visibleEquipment ?? []).find(e => {
+    const txt = `${e.name ?? ""} ${e.label ?? ""} ${e.title ?? ""}`.toLowerCase();
+    return txt.includes("péril") || txt.includes("peril") || txt.includes("ressource") || txt.includes("resource");
+  });
+  if (level >= maxLevel && nextParagonNode) return { title:`Poser le point parangon ${nextParagonNode.point}`, subtitle:`${nextParagonNode.boardName} · x${nextParagonNode.x}, y${nextParagonNode.y}`, why:"Tu es niveau max : ta vraie progression vient maintenant surtout du parangon, des glyphes et de l’équipement.", icon:"🧩", tone:"paragon" };
+  if (mustGear) { const name = mustGear.name ?? mustGear.label ?? mustGear.title; const hint = aspectHint(name); return { title:`Chercher / poser : ${name}`, subtitle:hint.source, why:hint.why, icon:hint.icon, tone:hint.type }; }
+  if (nextSkill) return {
+    title:`Vérifier le skill : ${nextSkill.name ?? nextSkill.skill ?? "prochain skill"}`,
+    subtitle:"Arbre de talents",
+    why:"À valider dans ton arbre pour rester aligné avec le guide.",
+    icon:"⚔️",
+    tone:"skill",
+    targetType:"skill",
+    targetId: nextSkill.skillPoint ?? nextSkill.id ?? nextSkill.skill ?? nextSkill.name,
+  };
+  return { title:"Jouer normalement et comparer les loots", subtitle:"Build stable", why:"Tu as validé les gros objectifs visibles. Passe en optimisation progressive.", icon:"✅", tone:"done" };
+}
+
+function SessionFocusCard({ action, buildPct, paragonLevel, level, onValidateSkill, onSkipSkill, onResetSkills }) {
+  const isSkillAction = action?.targetType === "skill";
+
+  return (
+    <section className={`session-focus ${action.tone}`}>
+      <div className="sf-icon">{action.icon}</div>
+      <div className="sf-main">
+        <span className="muted small">🎯 ACTION IMMÉDIATE — V18.1</span>
+        <h2>{action.title}</h2>
+        <p className="sf-sub">{action.subtitle}</p>
+        <p>{action.why}</p>
+
+        {isSkillAction && (
+          <div className="skill-action-row focus-actions">
+            <button className="skill-btn validate" onClick={onValidateSkill}>
+              ✓ appris
+            </button>
+            <button className="skill-btn skip" onClick={onSkipSkill}>
+              ⏭ ignorer
+            </button>
+            <button className="skill-btn reset" onClick={onResetSkills}>
+              ↩ reset talents
+            </button>
+          </div>
+        )}
+      </div>
+      <div className="sf-stats">
+        <strong>{buildPct}%</strong><span>build</span>
+        <strong>{level}</strong><span>niveau</span>
+        <strong>{paragonLevel}</strong><span>parangon</span>
+      </div>
+    </section>
+  );
+}
+
+function AspectSourceCard({ item, checked, onCheck }) {
+  const name = item.name ?? item.label ?? item.title ?? String(item);
+  const hint = aspectHint(name);
+  return (
+    <article className={`source-card ${checked ? "done" : ""}`}>
+      <div className="source-icon">{hint.icon}</div>
+      <div className="source-body">
+        <div className="source-top"><strong>{name}</strong><span className="tag">{hint.type}</span></div>
+        <p>{hint.why}</p>
+        <div className="source-meta"><span>📍 {hint.source}</span><span>➡️ {hint.where}</span></div>
+      </div>
+      <label className="source-check"><input type="checkbox" checked={checked} onChange={e => onCheck(e.target.checked)} /><span>validé</span></label>
+    </article>
+  );
+}
+
 function NextBox({ label, color, children }) {
   return (
     <div className="next-box" style={{ "--nc": color }}>
       <div className="next-label">{label}</div>
       <div className="next-content">{children}</div>
     </div>
+  );
+}
+
+
+function G9Mode({
+  state,
+  set,
+  immediateAction,
+  buildPct,
+  nextSkill,
+  nextParagonNode,
+  currentBoard,
+  build,
+  onValidateSkill,
+  onSkipSkill,
+  onResetSkills,
+}) {
+  const talionTabs = build?.talion?.guideTabs ?? [];
+  const defaultTalionTitle = talionTabs.find(t => /parangon/i.test(t.title ?? ""))?.title
+    ?? talionTabs.find(t => /compétence|talent|arbre/i.test(t.title ?? ""))?.title
+    ?? talionTabs[0]?.title
+    ?? "";
+  const [activeTalionTitle, setActiveTalionTitle] = useState(defaultTalionTitle);
+  const [selectedImage, setSelectedImage] = useState(null);
+  const activeTalionTab = talionTabs.find(t => t.title === activeTalionTitle) ?? talionTabs[0];
+  const talionImages = extractImagesFromHtml(activeTalionTab?.html ?? "");
+
+  return (
+    <div className={`g9-shell ${build?.talion ? "g9-talion-shell" : ""}`}>
+      <header className="g9-header">
+        <div>
+          <h1>D4 Companion <small>G9</small></h1>
+          <p>{build?.talion ? "Mode Talion second écran" : "Vue compacte second écran"}</p>
+        </div>
+        <button className="g9-exit" onClick={() => set({ g9: false })}>Vue complète</button>
+      </header>
+
+      <SessionFocusCard
+        action={immediateAction}
+        buildPct={buildPct}
+        paragonLevel={state.paragonLevel}
+        level={state.level}
+        onValidateSkill={onValidateSkill}
+        onSkipSkill={onSkipSkill}
+        onResetSkills={onResetSkills}
+      />
+
+      {build?.talion && (
+        <section className="g9-talion-panel">
+          <div className="g9-talion-head">
+            <div>
+              <span className="tag current">TALION</span>
+              <h2>{build.buildName}</h2>
+              <p>Navigation rapide guide / images. Clique l’image pour zoomer.</p>
+            </div>
+            <button className="g9-blue" onClick={() => set({ g9: false, tab: "talion" })}>Guide complet</button>
+          </div>
+
+          <div className="g9-talion-tabs">
+            {talionTabs.map(t => (
+              <button
+                key={t.title}
+                className={activeTalionTab?.title === t.title ? "on" : ""}
+                onClick={() => { setActiveTalionTitle(t.title); setSelectedImage(null); }}
+              >
+                {t.title}
+              </button>
+            ))}
+          </div>
+
+          {activeTalionTab && (
+            <div className="g9-talion-current">
+              <h3>{activeTalionTab.title}</h3>
+              {talionImages[0] ? (
+                <button className="g9-image-button" onClick={() => setSelectedImage(talionImages[0])}>
+                  <img src={talionImages[0].src} alt={talionImages[0].alt} />
+                  <span>🔍 ouvrir en grand</span>
+                </button>
+              ) : (
+                <p className="muted">Pas d’image détectée sur cet onglet.</p>
+              )}
+
+              {talionImages.length > 1 && (
+                <div className="g9-image-strip">
+                  {talionImages.slice(0, 8).map((img, i) => (
+                    <button key={`${img.src}-${i}`} onClick={() => setSelectedImage(img)}>
+                      Image {i + 1}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="g9-grid">
+        <div className="g9-card primary">
+          <span className="muted small">NEXT PARAGON</span>
+          {nextParagonNode ? (
+            <>
+              <h2>Point {nextParagonNode.point}</h2>
+              <p>{nextParagonNode.boardName}</p>
+              <strong>x{nextParagonNode.x}, y{nextParagonNode.y}</strong>
+              {nextParagonNode.glyphName && <em>🔷 {nextParagonNode.glyphName}</em>}
+            </>
+          ) : (
+            <>
+              <h2>{build?.talion ? "Voir image parangon" : "Parangon OK"}</h2>
+              <p>{build?.talion ? "Talion fournit surtout le chemin en image HD." : "Chemin couvert ou non débloqué."}</p>
+            </>
+          )}
+        </div>
+
+        <div className="g9-card">
+          <span className="muted small">BOARD</span>
+          <h2>{currentBoard?.name ?? "Talion"}</h2>
+          <p>{currentBoard?.glyphName ? `Glyphe : ${currentBoard.glyphName}` : "Guide visuel actif"}</p>
+        </div>
+
+        <div className="g9-card">
+          <span className="muted small">SKILL</span>
+          {nextSkill ? (
+            <>
+              <h2>{nextSkill.name ?? nextSkill.skill ?? `Point ${nextSkill.skillPoint}`}</h2>
+              <p>À vérifier dans ton arbre</p>
+            </>
+          ) : (
+            <>
+              <h2>{build?.talion ? "Arbre Talion" : "Cap talents"}</h2>
+              <p>{build?.talion ? "Utilise l’onglet Arbre / Talents ci-dessus." : "Post-70 : focus parangon/stuff"}</p>
+            </>
+          )}
+        </div>
+
+        <div className="g9-card">
+          <span className="muted small">PROGRESSION</span>
+          <h2>{buildPct}%</h2>
+          <p>{build?.buildName ?? build?.title ?? "Build chargé"}</p>
+        </div>
+      </section>
+
+      <section className="g9-help">
+        <strong>Routine rapide</strong>
+        <p>{build?.talion ? "Passe entre Arbre / Parangons / Équipement, ouvre l’image en grand, joue, puis reviens checker le prochain bloc." : "Regarde l’action immédiate → joue → coche ce qui est vraiment équipé/validé → l’objectif change."}</p>
+      </section>
+
+      {selectedImage && (
+        <TalionImageViewer
+          images={talionImages}
+          image={selectedImage}
+          onClose={() => setSelectedImage(null)}
+          onSelect={setSelectedImage}
+        />
+      )}
+    </div>
+  );
+}
+
+
+
+function extractImagesFromHtml(html = "") {
+  const out = [];
+  try {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    doc.querySelectorAll("img").forEach((img, index) => {
+      const src = img.getAttribute("src");
+      if (!src) return;
+      out.push({
+        src,
+        alt: img.getAttribute("alt") || `Image Talion ${index + 1}`,
+      });
+    });
+  } catch {
+    // ignore malformed HTML; the raw guide can still render below
+  }
+  return out;
+}
+
+function TalionImageViewer({ images, image, onClose, onSelect }) {
+  const [zoom, setZoom] = useState(1);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [drag, setDrag] = useState(null);
+
+  if (!image) return null;
+
+  const index = Math.max(0, images.findIndex(i => i.src === image.src));
+  const canPrev = images.length > 1;
+
+  function selectAt(nextIndex) {
+    const normalized = (nextIndex + images.length) % images.length;
+    onSelect(images[normalized]);
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+  }
+
+  function onWheel(e) {
+    e.preventDefault();
+    setZoom(z => {
+      const next = e.deltaY < 0 ? z + 0.18 : z - 0.18;
+      return Math.min(5, Math.max(0.55, next));
+    });
+  }
+
+  function reset() {
+    setZoom(1);
+    setOffset({ x: 0, y: 0 });
+  }
+
+  return (
+    <div className="talion-viewer" role="dialog" aria-modal="true" onClick={onClose}>
+      <div className="talion-viewer-toolbar" onClick={e => e.stopPropagation()}>
+        <strong>{image.alt}</strong>
+        <span className="muted small">{index + 1}/{images.length} · zoom {Math.round(zoom * 100)}%</span>
+        {canPrev && <button onClick={() => selectAt(index - 1)}>← précédente</button>}
+        {canPrev && <button onClick={() => selectAt(index + 1)}>suivante →</button>}
+        <button onClick={reset}>reset</button>
+        <a href={image.src} target="_blank" rel="noreferrer">ouvrir seule</a>
+        <button className="danger" onClick={onClose}>fermer</button>
+      </div>
+
+      <div
+        className="talion-viewer-stage"
+        onClick={e => e.stopPropagation()}
+        onWheel={onWheel}
+        onMouseDown={e => setDrag({ x: e.clientX, y: e.clientY, ox: offset.x, oy: offset.y })}
+        onMouseMove={e => {
+          if (!drag) return;
+          setOffset({ x: drag.ox + e.clientX - drag.x, y: drag.oy + e.clientY - drag.y });
+        }}
+        onMouseUp={() => setDrag(null)}
+        onMouseLeave={() => setDrag(null)}
+      >
+        <img
+          src={image.src}
+          alt={image.alt}
+          draggable={false}
+          style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function TalionGuide({ build }) {
+  const tabs = build.talion?.guideTabs ?? [];
+  const [active, setActive] = useState(tabs[0]?.title ?? "");
+  const [selectedImage, setSelectedImage] = useState(null);
+  const current = tabs.find(t => t.title === active) ?? tabs[0];
+  const currentImages = extractImagesFromHtml(current?.html ?? "");
+
+  if (!build.talion) return null;
+
+  function onGuideClick(e) {
+    const img = e.target?.closest?.("img");
+    if (!img) return;
+    const src = img.getAttribute("src");
+    if (!src) return;
+    setSelectedImage({ src, alt: img.getAttribute("alt") || current?.title || "Image Talion" });
+  }
+
+  return (
+    <main>
+      <section className="talion-banner">
+        <div>
+          <span className="tag current">TALION GUIDE MODE</span>
+          <h3>{build.talion.className || build.buildName}</h3>
+          <p>{build.talion.note}</p>
+          {build.talion.videoUrl && <a href={build.talion.videoUrl} target="_blank" rel="noreferrer">▶ Vidéo du build</a>}
+        </div>
+      </section>
+
+      <nav className="talion-subtabs">
+        {tabs.map(t => (
+          <button key={t.title} className={current?.title === t.title ? "on" : ""} onClick={() => setActive(t.title)}>
+            {t.title}
+          </button>
+        ))}
+      </nav>
+
+      {current && (
+        <section className="talion-guide panel">
+          <div className="talion-guide-head">
+            <div>
+              <h3>{current.title}</h3>
+              <p className="muted small">Clique une image pour zoomer. Molette = zoom, clic-glissé = déplacer.</p>
+            </div>
+            {currentImages[0] && (
+              <button className="talion-open-first" onClick={() => setSelectedImage(currentImages[0])}>
+                🔍 ouvrir 1ère image en grand
+              </button>
+            )}
+          </div>
+          <div className="talion-html" onClick={onGuideClick} dangerouslySetInnerHTML={{ __html: current.html }} />
+        </section>
+      )}
+
+      <TalionImageViewer
+        images={currentImages}
+        image={selectedImage}
+        onClose={() => setSelectedImage(null)}
+        onSelect={setSelectedImage}
+      />
+
+      {build.talion.lootFilter && (
+        <section className="panel talion-loot-filter">
+          <h3>Filtre de butin Talion</h3>
+          <textarea readOnly value={build.talion.lootFilter} onFocus={e => e.target.select()} />
+          <p className="muted small">Clique dans la zone puis Ctrl+A / Ctrl+C si besoin.</p>
+        </section>
+      )}
+    </main>
+  );
+}
+
+
+function ImportBar({ compact = false, onImported }) {
+  const [url, setUrl] = useState("https://www.talion.tv/diablo-4/builds/demoniste-apocalypse");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  async function doImport() {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      setMsg("Colle une URL Talion d'abord.");
+      return;
+    }
+
+    if (!trimmed.includes("talion.tv")) {
+      setMsg("Pour cette version, l'import direct supporte Talion uniquement.");
+      return;
+    }
+
+    setBusy(true);
+    setMsg("Import Talion en cours…");
+    try {
+      const res = await fetch(`/api/import-talion?url=${encodeURIComponent(trimmed)}`);
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      setMsg(`OK : ${data.buildName}`);
+      await onImported?.();
+    } catch (e) {
+      setMsg(`Erreur import : ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className={`import-bar${compact ? " compact" : ""}`}>
+      <div className="import-title">
+        <strong>📥 Import URL</strong>
+        <span className="muted small">Talion direct depuis api.talion.tv</span>
+      </div>
+      <div className="import-row">
+        <input
+          value={url}
+          onChange={e => setUrl(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") doImport(); }}
+          placeholder="https://www.talion.tv/diablo-4/builds/demoniste-apocalypse"
+        />
+        <button className="import-btn" disabled={busy} onClick={doImport}>
+          {busy ? "Import…" : "Importer"}
+        </button>
+      </div>
+      {msg && <p className={`import-msg${msg.startsWith("Erreur") ? " error" : ""}`}>{msg}</p>}
+    </section>
   );
 }
 
@@ -139,16 +875,35 @@ function App() {
 
   useEffect(() => { localStorage.setItem(LS_KEY, JSON.stringify(state)); }, [state]);
 
-  useEffect(() => {
-    fetch("/api/build")
-      .then(r => r.json())
-      .then(data => {
-        if (data.error === "no_build") { setNoBuild(true); setLoading(false); return; }
-        if (data.error) throw new Error(data.error);
-        setBuild(data); setLoading(false);
-      })
-      .catch(() => { setNoBuild(true); setLoading(false); });
+  const refreshBuild = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/build");
+      const data = await res.json();
+      if (data.error === "no_build") {
+        setNoBuild(true);
+        setBuild(null);
+        return;
+      }
+      if (data.error) throw new Error(data.error);
+      setBuild(data);
+      setNoBuild(false);
+      setState(s => ({
+        ...s,
+        tab: data.talion ? "talion" : s.tab,
+        skillChecked: {},
+        glyphChecked: {},
+        equipmentChecked: {},
+        ignoredSkills: {},
+      }));
+    } catch {
+      setNoBuild(true);
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => { refreshBuild(); }, [refreshBuild]);
 
   const set = useCallback(patch => setState(s => ({ ...s, ...patch })), []);
 
@@ -165,32 +920,103 @@ function App() {
       <p>Aucun build importé.</p>
       <div className="howto">
         <p>1. Lance le serveur : <code>npm start</code></p>
-        <p>2. Va sur une page de build <a href="https://mobalytics.gg/diablo-4/builds" target="_blank" rel="noreferrer">Mobalytics</a></p>
-        <p>3. Clique le favori <strong>D4 Companion</strong></p>
-        <p className="hint">Le bookmarklet se trouve dans <code>bookmarklet.js</code> — colle la ligne BOOKMARKLET: comme URL d'un favori.</p>
+        <p>2. Colle directement une URL Talion ci-dessous.</p>
+        <ImportBar onImported={refreshBuild} />
+        <p className="hint">Mobalytics reste disponible via le bookmarklet dans <code>bookmarklet.js</code>.</p>
       </div>
     </div>
   );
 
   const skillPath = build.skillPath ?? [];
   const boards    = build.boards ?? [];
+  const paragonPath = build.paragonPath ?? [];
+  const paragonUnlocked = state.level >= (build.paragonUnlockLevel ?? 70);
   const spEarned  = levelToSP(state.level, build.maxLevel ?? 70);
-  const curBoardIdx = Math.min(paragonLevelToBoard(state.paragonLevel), boards.length - 1);
+  const curBoardIdx = Math.min(paragonLevelToBoard(state.paragonLevel), Math.max(boards.length - 1, 0));
 
   const doneSkills = skillPath.filter(e => state.skillChecked[e.skillPoint]).length;
   const doneGlyphs = boards.filter(b => state.glyphChecked[b.glyph]).length;
+  const doneParagonNodes = Math.min(state.paragonLevel, paragonPath.length);
   const pct = skillPath.length ? Math.round((doneSkills / skillPath.length) * 100) : 0;
 
-  // Next undone skill that's within earned SPs
-  const nextSkill = skillPath.find(e => !state.skillChecked[e.skillPoint] && e.skillPoint <= spEarned + 1);
-  const currentBoard = boards[curBoardIdx];
+  // At max level, the user no longer gains skill points by leveling.
+  const nextSkill = state.level >= (build.maxLevel ?? 70)
+    ? skillPath.find(e => !state.skillChecked[e.skillPoint] && !state.ignoredSkills?.[e.skillPoint])
+    : skillPath.find(e => !state.skillChecked[e.skillPoint] && !state.ignoredSkills?.[e.skillPoint] && e.skillPoint <= spEarned + 1);
+
+  // Mobalytics stores paragon nodes in path order.
+  // paragonLevel = already spent/earned paragon points, so the next node is at this index.
+  const nextParagonNode = paragonUnlocked ? paragonPath[state.paragonLevel] : null;
+  const currentBoard = nextParagonNode
+    ? boards.find(b => b.slug === nextParagonNode.boardSlug) ?? boards[curBoardIdx]
+    : boards[curBoardIdx];
+
+  const visibleEquipment = (build.equipment ?? []).filter(e => !state.equipmentChecked?.[e.id ?? e.slug ?? e.name]);
+  const buildPct = Math.round((
+    doneSkills +
+    doneGlyphs +
+    Object.values(state.equipmentChecked ?? {}).filter(Boolean).length
+  ) / Math.max(1, skillPath.length + boards.length + (build.equipment?.length ?? 0)) * 100);
+
+  const immediateAction = bestImmediateAction({
+    nextSkill,
+    nextParagonNode,
+    visibleEquipment,
+    level: state.level,
+    maxLevel: build.maxLevel ?? 70,
+  });
+
+  function validateCurrentSkill() {
+    if (!nextSkill) return;
+    set({
+      skillChecked: {
+        ...state.skillChecked,
+        [nextSkill.skillPoint]: true,
+      },
+    });
+  }
+
+  function skipCurrentSkill() {
+    if (!nextSkill) return;
+    set({
+      ignoredSkills: {
+        ...(state.ignoredSkills ?? {}),
+        [nextSkill.skillPoint]: true,
+      },
+    });
+  }
+
+  function resetSkillValidation() {
+    set({
+      skillChecked: {},
+      ignoredSkills: {},
+    });
+  }
+
+  if (state.g9) {
+    return (
+      <G9Mode
+        state={state}
+        set={set}
+        immediateAction={immediateAction}
+        buildPct={buildPct}
+        nextSkill={nextSkill}
+        nextParagonNode={nextParagonNode}
+        currentBoard={currentBoard}
+        build={build}
+        onValidateSkill={validateCurrentSkill}
+        onSkipSkill={skipCurrentSkill}
+        onResetSkills={resetSkillValidation}
+      />
+    );
+  }
 
   const visibleSkills = skillPath.filter(e =>
     !(state.hideDone && state.skillChecked[e.skillPoint])
   );
 
   return (
-    <div className="app">
+    <div className={`app ${state.tab === "talion" ? "app-wide" : ""}`}>
 
       {/* Header */}
       <header className="hdr">
@@ -198,7 +1024,10 @@ function App() {
           <span className="hdr-logo">D4</span>
           <div>
             <h1>{build.buildName}</h1>
-            <p className="hdr-sub">par {build.author} · {build.totalSkillPoints} skill pts · {build.totalParagonNodes} nœuds paragon</p>
+            <p className="hdr-sub">
+              <span className={`provider-badge ${build.provider ?? "mobalytics"}`}>{build.provider === "talion" ? "Talion" : "Mobalytics"}</span>
+              par {build.author} · {build.totalSkillPoints} skill pts · {build.totalParagonNodes} nœuds paragon
+            </p>
           </div>
         </div>
         <div className="hdr-ring">
@@ -214,12 +1043,15 @@ function App() {
         </div>
       </header>
 
+      <ImportBar compact onImported={refreshBuild} />
+
       {/* Level controls */}
       <section className="levels">
         <LevelSlider label="Niveau perso" icon="🧙" value={state.level} max={build.maxLevel ?? 70} onChange={v => set({ level: v })} />
         <LevelSlider label="Niveau paragon" icon="🧩" value={state.paragonLevel} max={300} onChange={v => set({ paragonLevel: v })} />
         <div className="level-info">
-          <span>⚡ {spEarned} skill points débloqués</span>
+          <span>⚡ {state.level >= (build.maxLevel ?? 70) ? "cap talents atteint" : `${spEarned} skill points débloqués`}</span>
+          <span>🧩 Parangon : {doneParagonNodes}/{paragonPath.length} nœuds</span>
           <span>🗺 Plateau : {currentBoard?.name ?? "—"}</span>
           <span>✅ {doneSkills}/{skillPath.length} skills · {doneGlyphs}/{boards.length} glyphes</span>
         </div>
@@ -244,29 +1076,88 @@ function App() {
           ) : <span className="muted">Tous les skills pris ✓</span>}
         </NextBox>
 
-        <NextBox label="🔷 PROCHAIN GLYPHE" color="#c084fc">
-          {currentBoard ? (
-            <div>
-              <strong>{currentBoard.glyphName}</strong>
-              <span className="muted"> sur {currentBoard.name}</span>
+        <NextBox label="🧩 PROCHAIN PARAGON" color="#c084fc">
+          {nextParagonNode ? (
+            <div className="next-paragon">
+              <strong>Nœud {nextParagonNode.point}</strong>
+              <span className="muted"> · {nextParagonNode.boardName}</span>
               <div style={{fontSize:"0.8em",marginTop:2,color:"#94a3b8"}}>
-                {state.glyphChecked[currentBoard.glyph] ? "✓ Monté" : "À monter au niveau 21+"}
+                📍 x{nextParagonNode.x}, y{nextParagonNode.y}
+                {nextParagonNode.glyphName ? ` · 🔷 route ${nextParagonNode.glyphName}` : ""}
               </div>
             </div>
-          ) : <span className="muted">`Paragon non débloqué (lvl ${build.paragonUnlockLevel ?? 70})`</span>}
+          ) : (
+            <span className="muted">
+              {paragonUnlocked ? "Tous les nœuds du path sont couverts ✓" : `Paragon débloqué au niveau ${build.paragonUnlockLevel ?? 70}`}
+            </span>
+          )}
         </NextBox>
       </section>
 
       {/* Tabs */}
       <nav className="tabs">
-        {[["skills","⚔️ Skills"],["paragon","🧩 Paragon"],["gear","🎽 Équipement"],["talismans","🧿 Talismans"],["merc","⚔️ Mercenaire"]].map(([id, lbl]) => (
+        {[["focus","🎯 Focus"],["skills","⚔️ Skills"],["paragon","🧩 Paragon"],["gear","🎽 Équipement"],["talismans","🧿 Talismans"],["merc","⚔️ Mercenaire"], ...(build.talion ? [["talion","📜 Guide Talion"]] : [])].map(([id, lbl]) => (
           <button key={id} className={`tab${state.tab===id?" on":""}`} onClick={() => set({ tab: id })}>{lbl}</button>
         ))}
+        <button className="tab g9-toggle" onClick={() => set({ g9: true })}>🖥️ Mode G9</button>
         <button className={`tab filter${state.hideDone?" on":""}`} onClick={() => set({ hideDone: !state.hideDone })}>
           {state.hideDone ? "👁 Tout voir" : "✓ Cacher faits"}
         </button>
-        <button className="tab reset" onClick={() => { if(confirm("Reset ?")) set({ skillChecked:{}, glyphChecked:{} }); }}>🔄</button>
+        <button className="tab reset" onClick={() => { if(confirm("Reset ?")) set({ skillChecked:{}, glyphChecked:{}, equipmentChecked:{}, ignoredSkills:{} }); }}>🔄</button>
       </nav>
+
+      {/* Focus */}
+      {state.tab === "focus" && (
+        <main>
+          <SessionFocusCard
+            action={immediateAction}
+            buildPct={buildPct}
+            paragonLevel={state.paragonLevel}
+            level={state.level}
+            onValidateSkill={validateCurrentSkill}
+            onSkipSkill={skipCurrentSkill}
+            onResetSkills={resetSkillValidation}
+          />
+
+          {build.talion && (
+            <section className="panel talion-focus-note">
+              <h3>📜 Build Talion détecté</h3>
+              <p>Talion fournit surtout le build sous forme de guide HTML et images intégrées. Va dans l’onglet <strong>Guide Talion</strong> pour lire l’arbre, le parangon, l’équipement, les charmes et le filtre de butin.</p>
+            </section>
+          )}
+
+          <section className="focus-grid">
+            <div className="panel">
+              <h3>Sources / obtention à surveiller</h3>
+              {(visibleEquipment ?? []).slice(0, 10).map(item => {
+                const key = item.id ?? item.slug ?? item.name;
+                return (
+                  <AspectSourceCard key={key} item={item}
+                    checked={!!state.equipmentChecked?.[key]}
+                    onCheck={v => set({ equipmentChecked: { ...(state.equipmentChecked ?? {}), [key]: v } })}
+                  />
+                );
+              })}
+            </div>
+
+            <div className="panel">
+              <h3>Lecture noob friendly</h3>
+              <div className="coach-note">
+                <strong>Priorité réelle post-70</strong>
+                <p>Ton niveau perso ne monte plus : la progression vient surtout du parangon, des glyphes, des aspects et du stuff.</p>
+              </div>
+              <div className="coach-note">
+                <strong>Ne chase pas tout</strong>
+                <p>Survie + ressource d’abord. Les gros dégâts sont excellents, mais seulement si le build tient debout.</p>
+              </div>
+              <div className="coach-note">
+                <strong>Routine simple</strong>
+                <p>Joue 30 min, coche ce que tu as vraiment équipé, puis laisse l’action immédiate changer toute seule.</p>
+              </div>
+            </div>
+          </section>
+        </main>
+      )}
 
       {/* Skills */}
       {state.tab === "skills" && (
@@ -293,17 +1184,52 @@ function App() {
       {state.tab === "paragon" && (
         <main>
           {state.level < (build.paragonUnlockLevel ?? 70) && (
-            <div className="warn">🔒 🔒 Paragon débloqué au niveau {build.paragonUnlockLevel ?? 70} (tu es niveau {state.level})</div>
+            <div className="warn">🔒 Paragon débloqué au niveau {build.paragonUnlockLevel ?? 70} (tu es niveau {state.level})</div>
           )}
+
+          {nextParagonNode && (
+            <div className="paragon-focus">
+              <div>
+                <span className="muted small">PROCHAIN POINT PARAGON</span>
+                <h3>Nœud {nextParagonNode.point} · {nextParagonNode.boardName}</h3>
+                <p>📍 Coordonnées Mobalytics : x{nextParagonNode.x}, y{nextParagonNode.y}</p>
+                <p>🧩 Plateau : {currentBoard?.name ?? nextParagonNode.boardName}</p>
+                {nextParagonNode.glyphName && <p>🔷 Route du glyphe : {nextParagonNode.glyphName}</p>}
+              </div>
+              <span className="tag current">PARAGON {state.paragonLevel}</span>
+            </div>
+          )}
+
           <div className="boards-grid">
             {boards.map((b, i) => (
               <BoardCard key={b.slug} board={b}
-                isActive={i === curBoardIdx && state.level >= 50}
+                isActive={currentBoard?.slug === b.slug && state.level >= (build.paragonUnlockLevel ?? 70)}
                 done={!!state.glyphChecked[b.glyph]}
                 onToggle={v => set({ glyphChecked: { ...state.glyphChecked, [b.glyph]: v } })}
               />
             ))}
           </div>
+
+          <ParagonBoardMap
+            paragonPath={paragonPath}
+            paragonLevel={state.paragonLevel}
+            currentBoard={currentBoard}
+            nextNode={nextParagonNode}
+          />
+
+          <div className="paragon-path compact">
+            <h3>Prochains points à poser</h3>
+            {(paragonPath ?? []).slice(
+              state.paragonLevel,
+              Math.min(paragonPath.length, state.paragonLevel + 10)
+            ).map(node => (
+              <ParagonNodeRow key={`${node.slug}-${node.point}`} node={node}
+                isCurrent={nextParagonNode?.point === node.point}
+                isDone={node.point <= state.paragonLevel}
+              />
+            ))}
+          </div>
+
           {build.paragonPriority?.length > 0 && (
             <div className="glyph-order">
               <h3>Ordre de montée des glyphes</h3>
@@ -319,7 +1245,7 @@ function App() {
               ))}
             </div>
           )}
-          <p className="muted small">{build.totalParagonNodes} nœuds paragon au total</p>
+          <p className="muted small" style={{padding:"0 16px"}}>{paragonPath.length || build.totalParagonNodes} nœuds paragon au total · affichage centré autour de ton niveau parangon</p>
         </main>
       )}
 
@@ -454,10 +1380,15 @@ function App() {
         </main>
       )}
 
+      {/* Talion guide */}
+      {state.tab === "talion" && build.talion && (
+        <TalionGuide build={build} />
+      )}
+
       {/* Footer */}
       <footer className="footer">
-        <span className="muted small">Importé le {new Date(build.importedAt).toLocaleDateString("fr-FR")} depuis {build.sourceUrl ? <a href={build.sourceUrl} target="_blank" rel="noreferrer">Mobalytics</a> : "fichier local"}</span>
-        <span className="muted small">D4 Companion v13</span>
+        <span className="muted small">Importé le {new Date(build.importedAt).toLocaleDateString("fr-FR")} depuis {build.sourceUrl ? <a href={build.sourceUrl} target="_blank" rel="noreferrer">{build.provider === "talion" ? "Talion" : "Mobalytics"}</a> : (build.provider === "talion" ? "Talion local" : "fichier local")}</span>
+        <span className="muted small">D4 Companion v19-tal</span>
       </footer>
     </div>
   );

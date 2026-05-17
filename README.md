@@ -1,14 +1,11 @@
-# D4 Lite Companion v12 Skill/Paragon Path
+# Diablo 4 Companion v18.1 — Focus Validation Fixed
 
-V12 preview :
-- Skill Tree Path
-- Paragon Path
-- NEXT SKILL POINT
-- NEXT PARAGON
-- progression globale
-- objectifs build V10 conservés
-
-Important : le parsing Mobalytics reste best-effort. Si le chemin exact n'est pas lisible, la V12 affiche un fallback structuré.
+Correction bloquante :
+- les boutons sont maintenant dans le gros bloc Action immédiate
+- ✓ appris valide le skill courant
+- ⏭ ignorer masque le skill courant
+- ↩ reset talents remet la progression talents à zéro
+- fonctionne aussi en Mode G9
 
 ## Lancer
 
